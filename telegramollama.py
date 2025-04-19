@@ -6,6 +6,9 @@ import os
 import json
 import logging
 from typing import Dict, Any
+import asyncio
+import re
+
 
 # Configure logging
 logging.basicConfig(
@@ -168,20 +171,21 @@ class OllamaTelegramBot:
         except Exception as e:
             logger.error(f"Error clearing chat: {e}")
             await update.message.reply_text("Error clearing the chat.")
+    
 
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+       async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle user messages."""
         user_id = update.effective_user.id
-        
+
         try:
             model = await self.get_user_model(user_id)
-            
+    
             # Show typing indicator
             await context.bot.send_chat_action(
                 chat_id=update.effective_chat.id,
                 action="typing"
             )
-            
+    
             response = requests.post(
                 f"{API_BASE_URL}/chat",
                 json={
@@ -190,44 +194,127 @@ class OllamaTelegramBot:
                     "session_id": str(user_id)
                 }
             )
-            
+
             data = response.json()
             if data["success"]:
                 response_text = data["response"]
-                #split into chunks
-                chunks = self._split_text(response_text)
-
+                
+                # Split into chunks but preserve Markdown formatting
+                chunks = self._split_text_preserve_markdown(response_text)
+            
                 for i, chunk in enumerate(chunks):
                     if i > 0:
-                        await asyncio.sleep(5) #add delay between messages
-
-                    await context.bot.send_message(
+                        # Keep showing typing indicator between chunks
+                        await context.bot.send_chat_action(
+                            chat_id=update.effective_chat.id,
+                            action="typing"
+                        )
+                        await asyncio.sleep(2)  # Reduced delay between chunks
+                    
+                    try:
+                        # Try with Markdown first
+                        await context.bot.send_message(
                             chat_id=update.effective_chat.id,
                             text=chunk,
                             parse_mode='Markdown'
                         )
+                    except Exception as markdown_error:
+                        logger.error(f"Markdown parsing error: {markdown_error}")
+                        # Fallback to sending without parse_mode
+                        try:
+                            await context.bot.send_message(
+                                chat_id=update.effective_chat.id,
+                                text=chunk,
+                                parse_mode=None
+                            )
+                        except Exception as fallback_error:
+                            logger.error(f"Error even with fallback: {fallback_error}")
+                            # Final fallback - send error message
+                            await context.bot.send_message(
+                                chat_id=update.effective_chat.id,
+                                text=f"Error sending part of the response. The message was too long or contained invalid formatting."
+                            )    
             else:
+                error_msg = data.get("error", "Unknown error")
                 await update.message.reply_text(
-                    "Sorry, I encountered an error. Please try again."
+                    f"Sorry, I encountered an error: {error_msg}"
                 )
         except Exception as e:
             logger.error(f"Error handling message: {e}")
             await update.message.reply_text(
-                "Error handling the message."
+                f"Error handling the message: {str(e)[:100]}..."
             )
-    def _split_text(self, text: str) -> list[str]:
-        MAX_MESSAGE_LENGTH = 4080
-        chunks = []
 
-        while len(text) > MAX_MESSAGE_LENGTH:
-            chunk = text[:MAX_MESSAGE_LENGTH]
-            #REMOVE WHITESPACES TO AVOID PARTIAL WORD ISSUES
-            chunk = chunk.rstrip()
-            chunks.append(chunk)
-            text = text[MAX_MESSAGE_LENGTH:]
-        if text.strip(): #add remaining text if not empty
-            chunks.append(text)
+    def _split_text_preserve_markdown(self, text: str) -> list:
+        """Split text into chunks while preserving Markdown code blocks."""
+        MAX_MESSAGE_LENGTH = 4000  # Slightly reduced from 4096 for safety
+    
+        # If text is short enough, return it as a single chunk
+        if len(text) <= MAX_MESSAGE_LENGTH:
+            return [text]
+    
+        chunks = []
+        remaining_text = text
+    
+    # Process the text ensuring code blocks aren't split
+        while remaining_text:
+            if len(remaining_text) <= MAX_MESSAGE_LENGTH:
+                chunks.append(remaining_text)
+                break
+        
+        # Find all code block positions
+            code_block_starts = [m.start() for m in re.finditer(r'```', remaining_text)]
+        
+        # If no code blocks or only one marker, just split normally
+            if len(code_block_starts) < 2:
+                cut_point = MAX_MESSAGE_LENGTH
+            
+            # Try to cut at paragraph boundaries
+                paragraph_boundary = remaining_text.rfind('\n\n', 0, cut_point)
+                if paragraph_boundary > MAX_MESSAGE_LENGTH // 2:
+                    cut_point = paragraph_boundary + 2
+                else:
+                # Try to cut at sentence boundaries
+                    sentence_boundary = remaining_text.rfind('. ', 0, cut_point)
+                    if sentence_boundary > MAX_MESSAGE_LENGTH // 2:
+                        cut_point = sentence_boundary + 2
+            
+                chunks.append(remaining_text[:cut_point])
+                remaining_text = remaining_text[cut_point:]
+                continue
+        
+        # Process code blocks
+            i = 0
+            while i < len(code_block_starts) - 1:
+                start = code_block_starts[i]
+                end = code_block_starts[i+1]
+            
+            # If a code block would be split by our max length
+                if start < MAX_MESSAGE_LENGTH and end > MAX_MESSAGE_LENGTH:
+                # Find the last safe cut point before the code block
+                    cut_point = remaining_text.rfind('\n\n', 0, start)
+                    if cut_point <= 0 or cut_point < MAX_MESSAGE_LENGTH // 2:
+                    # If no good break point, just cut at start of code block
+                        cut_point = start
+                
+                    chunks.append(remaining_text[:cut_point])
+                    remaining_text = remaining_text[cut_point:]
+                    break
+            
+                i += 2  # Move to next potential code block
+        
+        # If we haven't added a chunk in this iteration, cut normally
+            if len(remaining_text) > MAX_MESSAGE_LENGTH and i >= len(code_block_starts) - 1:
+                cut_point = MAX_MESSAGE_LENGTH
+                paragraph_boundary = remaining_text.rfind('\n\n', 0, cut_point)
+                if paragraph_boundary > MAX_MESSAGE_LENGTH // 2:
+                    cut_point = paragraph_boundary + 2
+            
+                chunks.append(remaining_text[:cut_point])
+                remaining_text = remaining_text[cut_point:]
+    
         return chunks
+
 
 def main() -> None:
     """Start the bot."""
