@@ -25,12 +25,13 @@ DEFAULT_MODEL = "mistral"  # Set default model to mistral
 class OllamaTelegramBot:
     def __init__(self):
         self.active_models: Dict[int, str] = {}  # Store active model for each user
+        self.request_timeout = 300  # 5 minutes timeout for long responses
         
     async def ensure_model_exists(self, model_name: str) -> bool:
         """Check if model exists and pull if it doesn't."""
         try:
             # Check available models
-            response = requests.get(f"{API_BASE_URL}/models")
+            response = requests.get(f"{API_BASE_URL}/models", timeout=30)  # 30 second timeout for model list
             data = response.json()
             
             if not data["success"]:
@@ -40,10 +41,13 @@ class OllamaTelegramBot:
             
             if model_name not in available_models:
                 # Try to pull the model
-                pull_response = requests.post(f"{API_BASE_URL}/models/pull/{model_name}")
+                pull_response = requests.post(f"{API_BASE_URL}/models/pull/{model_name}", timeout=600)  # 10 minute timeout for model pull
                 return pull_response.json()["success"]
                 
             return True
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout while ensuring model exists: {model_name}")
+            return False
         except Exception as e:
             logger.error(f"Error ensuring model exists: {e}")
             return False
@@ -173,7 +177,7 @@ class OllamaTelegramBot:
             await update.message.reply_text("Error clearing the chat.")
     
 
-       async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle user messages."""
         user_id = update.effective_user.id
 
@@ -186,16 +190,44 @@ class OllamaTelegramBot:
                 action="typing"
             )
     
-            response = requests.post(
-                f"{API_BASE_URL}/chat",
-                json={
-                    "model": model,
-                    "message": update.message.text,
-                    "session_id": str(user_id)
-                }
-            )
+            try:
+                response = requests.post(
+                    f"{API_BASE_URL}/chat",
+                    json={
+                        "model": model,
+                        "message": update.message.text,
+                        "session_id": str(user_id)
+                    },
+                    timeout=self.request_timeout
+                )
+                
+                if not response.ok:
+                    logger.error(f"HTTP error {response.status_code}: {response.text}")
+                    await update.message.reply_text(
+                        f"Server error: HTTP {response.status_code}. Please try again later."
+                    )
+                    return
 
-            data = response.json()
+                data = response.json()
+            except requests.exceptions.Timeout:
+                logger.error("Request timed out while waiting for model response")
+                await update.message.reply_text(
+                    "The request timed out while generating the response. This can happen with very long responses. Please try again or try breaking your request into smaller parts."
+                )
+                return
+            except requests.exceptions.ConnectionError:
+                logger.error("Connection error to Flask backend")
+                await update.message.reply_text(
+                    "Could not connect to the model server. Please ensure the server is running."
+                )
+                return
+            except Exception as e:
+                logger.error(f"Error making request to Flask backend: {e}")
+                await update.message.reply_text(
+                    "An error occurred while communicating with the model server. Please try again later."
+                )
+                return
+
             if data["success"]:
                 response_text = data["response"]
                 
@@ -209,40 +241,40 @@ class OllamaTelegramBot:
                             chat_id=update.effective_chat.id,
                             action="typing"
                         )
-                        await asyncio.sleep(2)  # Reduced delay between chunks
+                        await asyncio.sleep(1)
                     
                     try:
-                        # Try with Markdown first
+                        # Escape special characters for MarkdownV2 but preserve code blocks
+                        formatted_chunk = self._escape_markdown_v2(chunk)
                         await context.bot.send_message(
                             chat_id=update.effective_chat.id,
-                            text=chunk,
-                            parse_mode='Markdown'
+                            text=formatted_chunk,
+                            parse_mode='MarkdownV2'
                         )
                     except Exception as markdown_error:
-                        logger.error(f"Markdown parsing error: {markdown_error}")
-                        # Fallback to sending without parse_mode
+                        logger.error(f"MarkdownV2 parsing error: {markdown_error}")
+                        # Fallback to plain text if markdown fails
                         try:
                             await context.bot.send_message(
                                 chat_id=update.effective_chat.id,
-                                text=chunk,
-                                parse_mode=None
+                                text=chunk
                             )
                         except Exception as fallback_error:
-                            logger.error(f"Error even with fallback: {fallback_error}")
-                            # Final fallback - send error message
-                            await context.bot.send_message(
-                                chat_id=update.effective_chat.id,
-                                text=f"Error sending part of the response. The message was too long or contained invalid formatting."
-                            )    
+                            logger.error(f"Error sending message chunk: {fallback_error}")
+                            await update.message.reply_text(
+                                "Failed to send part of the response. The message might be too long or contain invalid characters."
+                            )
+                            break
             else:
                 error_msg = data.get("error", "Unknown error")
+                logger.error(f"Error from model server: {error_msg}")
                 await update.message.reply_text(
-                    f"Sorry, I encountered an error: {error_msg}"
+                    f"The model encountered an error: {error_msg}"
                 )
         except Exception as e:
-            logger.error(f"Error handling message: {e}")
+            logger.error(f"Unexpected error in handle_message: {e}", exc_info=True)
             await update.message.reply_text(
-                f"Error handling the message: {str(e)[:100]}..."
+                "An unexpected error occurred. Please try again later."
             )
 
     def _split_text_preserve_markdown(self, text: str) -> list:
@@ -315,6 +347,34 @@ class OllamaTelegramBot:
     
         return chunks
 
+    def _escape_markdown_v2(self, text: str) -> str:
+        """
+        Escape special characters for Telegram's MarkdownV2 format while preserving code blocks.
+        """
+        # Split text by code blocks
+        parts = text.split("```")
+        
+        # Characters that need to be escaped in MarkdownV2 outside of code blocks
+        escape_chars = '_*[]()~`>#+-=|{}.!'
+        
+        for i in range(len(parts)):
+            # Even indices are outside code blocks, odd indices are inside
+            if i % 2 == 0:
+                # Escape special characters outside code blocks
+                for char in escape_chars:
+                    parts[i] = parts[i].replace(char, f"\\{char}")
+            else:
+                # For code blocks, add language if specified
+                code_lines = parts[i].strip().split('\n', 1)
+                if len(code_lines) > 1 and code_lines[0]:
+                    # If there's a language specified
+                    lang = code_lines[0]
+                    code = code_lines[1]
+                    parts[i] = f"{lang}\n{code}"
+                
+        # Rejoin the text with code block markers
+        return "```".join(parts)
+
 
 def main() -> None:
     """Start the bot."""
@@ -339,3 +399,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
